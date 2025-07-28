@@ -173,12 +173,6 @@ void SlamToolbox::setParams()
   enable_interactive_mode_ = this->declare_parameter("enable_interactive_mode",
       enable_interactive_mode_);
 
-  restamp_tf_ = false;
-  if (!this->has_parameter("restamp_tf")) {
-    this->declare_parameter("restamp_tf", restamp_tf_);
-  }
-  restamp_tf_ = this->get_parameter("restamp_tf").as_bool();
-
   double tmp_val = 0.5;
   tmp_val = this->declare_parameter("transform_timeout", tmp_val);
   transform_timeout_ = rclcpp::Duration::from_seconds(tmp_val);
@@ -245,6 +239,23 @@ void SlamToolbox::setROSInterfaces()
     tf2::durationFromSec(transform_timeout_.seconds()));
   scan_filter_->registerCallback(
     std::bind(&SlamToolbox::laserCallback, this, std::placeholders::_1));
+    
+  label_sub_ = this->create_subscription<std_msgs::msg::String>(
+      "/label", rclcpp::SystemDefaultsQoS(),
+      std::bind(&SlamToolbox::labelCallback, this, std::placeholders::_1));
+}
+
+/*****************************************************************************/
+void SlamToolbox::labelCallback(const std_msgs::msg::String::SharedPtr msg)
+/*****************************************************************************/
+{
+  try {
+    nlohmann::json j = nlohmann::json::parse(msg->data);
+    labelJSON_.push_back(j);
+  }
+  catch (nlohmann::json::parse_error &e) {
+    RCLCPP_ERROR(get_logger(), "JSON parse error: %s", e.what());
+  }
 }
 
 /*****************************************************************************/
@@ -267,11 +278,7 @@ void SlamToolbox::publishTransformLoop(
         msg.transform = tf2::toMsg(map_to_odom_);
         msg.child_frame_id = odom_frame_;
         msg.header.frame_id = map_frame_;
-        if (restamp_tf_) {
-          msg.header.stamp = now() + transform_timeout_;
-        } else {
-          msg.header.stamp = scan_timestamp + transform_timeout_;
-        }
+        msg.header.stamp = scan_timestamp + transform_timeout_;
         tfB_->sendTransform(msg);
       }
     }
@@ -505,6 +512,7 @@ LocalizedRangeScan * SlamToolbox::getLocalizedRangeScan(
   range_scan->SetOdometricPose(transformed_pose);
   range_scan->SetCorrectedPose(transformed_pose);
   range_scan->SetTime(rclcpp::Time(scan->header.stamp).nanoseconds()/1.e9);
+  
   return range_scan;
 }
 
@@ -555,6 +563,81 @@ bool SlamToolbox::shouldProcessScan(
   last_scan_time = scan->header.stamp;
 
   return true;
+}
+
+/*****************************************************************************/
+std::vector<int> SlamToolbox::processHazardLabels(const Pose2 & current_pose)
+/*****************************************************************************/
+{
+  int rounded_theta = -1;
+  int robot_calibration_count = 10;
+  bool error_trigger = true;
+
+  RCLCPP_WARN(get_logger(), "==========================================");
+  try {
+    rounded_theta = static_cast<int>(std::round(current_pose.GetHeading() * 180.0 / M_PI));
+    rounded_theta = ((rounded_theta % 360) + 360) % 360;
+    RCLCPP_WARN(get_logger(), "Robot current rotation  : %d", rounded_theta);
+  } catch (const tf2::TransformException & e) {
+    RCLCPP_ERROR(get_logger(), "TF exception while getting robot pose: %s", e.what());
+  } catch (const std::exception & e) {
+    RCLCPP_ERROR(get_logger(), "Unexpected exception while getting robot pose: %s", e.what());
+  }
+
+  if (rounded_theta == -1) {
+    RCLCPP_WARN(get_logger(), "Failed to get robot pose. Collected: %zu", launch_pose_rotation.size());
+  }
+  else if (launch_pose_rotation.size() < robot_calibration_count) {
+    launch_pose_rotation.push_back(rounded_theta);
+    RCLCPP_WARN(get_logger(), "Odometry pose drift is still being collected: %zu/%d", launch_pose_rotation.size(), robot_calibration_count);
+  }
+  else if (average_drift_ == -1) {
+    // Calculate the average_drift_ of z axis
+    RCLCPP_WARN(get_logger(), "Calculating average initial rotation from %d launch poses", robot_calibration_count);
+    int sum = 0;
+    for (size_t i = 0; i < launch_pose_rotation.size(); ++i) {
+      sum += launch_pose_rotation[i];
+    }
+    average_drift_ = sum / static_cast<int>(launch_pose_rotation.size());
+  }
+  else {
+    RCLCPP_WARN(get_logger(), "Callibrated with pose drift: %d deg", average_drift_);
+  }
+
+  // Segmentation data validation
+  if (labelJSON_.empty()) {
+    RCLCPP_WARN(get_logger(), "No segmentation data, skipping..");
+  }
+  else {
+    try {
+      auto &labelCheck = labelJSON_.back();
+      if (!labelCheck.contains("detected") || !labelCheck["detected"].is_array() || labelCheck["detected"].size() != 360) {
+        RCLCPP_WARN(get_logger(), "Segmentation data is not valid, skipping..");
+        throw std::runtime_error("Invalid segmentation data format");
+      }
+      
+      // Segmentation data shifting based on the robot's quaternion
+      labelReads_ = labelCheck["detected"].get<std::vector<int>>();
+      int shift = ((rounded_theta - average_drift_) % 360 + 360) % 360;
+
+      for (size_t i = 0; i < 360; ++i) {
+        rotatedLabelReads_[(i + shift) % 360] = labelReads_[i];
+      }
+
+      error_trigger = false;
+    }
+    catch (const nlohmann::json::exception &e) {
+      RCLCPP_ERROR(get_logger(), "JSON exception while checking segmentation data: %s", e.what());
+    }
+  }
+
+  if (error_trigger) {
+    RCLCPP_ERROR(get_logger(), "Returning default label reads due to error in segmentation data");
+    return std::vector<int>(360, 100);
+  } else {
+    RCLCPP_WARN(get_logger(), "Returning rotated label reads with %zu elements", rotatedLabelReads_.size());
+    return rotatedLabelReads_;
+  }
 }
 
 /*****************************************************************************/
@@ -613,6 +696,14 @@ LocalizedRangeScan * SlamToolbox::addScan(
   // if successfully processed, create odom to map transformation
   // and add our scan to storage
   if (processed) {
+    std::vector<int> hLabels = processHazardLabels(range_scan->GetCorrectedPose());
+    // std::cout << "============1st============" << std::endl;
+    // std::cout << "Current labels size : " << hLabels.size() << std::endl;
+    // std::cout << "Index [0] : " << hLabels[0] << std::endl;
+    // std::cout << "Index [1] : " << hLabels[1] << std::endl;
+    // std::cout << "= = = = = = = = = = = = = =" << std::endl;
+    range_scan->SaveHazardLabels(hLabels);
+
     if (enable_interactive_mode_) {
       scan_holder_->addScan(*scan);
     }

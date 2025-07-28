@@ -28,8 +28,10 @@
 #include <cstdlib>
 #include <memory>
 #include <fstream>
+#include <nlohmann/json.hpp>
 
 #include "rclcpp/rclcpp.hpp"
+#include "std_msgs/msg/string.hpp"
 #include "message_filters/subscriber.h"
 #include "tf2_ros/transform_broadcaster.h"
 #include "tf2_ros/transform_listener.h"
@@ -89,6 +91,7 @@ protected:
     const std::shared_ptr<rmw_request_id_t> request_header,
     const std::shared_ptr<slam_toolbox::srv::DeserializePoseGraph::Request> req,
     std::shared_ptr<slam_toolbox::srv::DeserializePoseGraph::Response> resp);
+  virtual void labelCallback(const std_msgs::msg::String::SharedPtr msg);
 
   // Loaders
   void loadSerializedPoseGraph(std::unique_ptr<karto::Mapper> &, std::unique_ptr<karto::Dataset> &);
@@ -139,6 +142,10 @@ protected:
   std::shared_ptr<rclcpp::Service<slam_toolbox::srv::Pause>> ssPauseMeasurements_;
   std::shared_ptr<rclcpp::Service<slam_toolbox::srv::SerializePoseGraph>> ssSerialize_;
   std::shared_ptr<rclcpp::Service<slam_toolbox::srv::DeserializePoseGraph>> ssDesserialize_;
+  std::shared_ptr<rclcpp::Subscription<std_msgs::msg::String>> label_sub_;
+
+  // Functional Semantic Utils
+  virtual std::vector<int> processHazardLabels(const Pose2 & pose);
 
   // Storage for ROS parameters
   std::string odom_frame_, map_frame_, base_frame_, map_name_, scan_topic_;
@@ -147,11 +154,21 @@ protected:
   std_msgs::msg::Header scan_header;
   int throttle_scans_, scan_queue_size_;
 
+  // Storage for Semantic Labels
+  std::vector<nlohmann::json> labelJSON_;
+  std::vector<int> labelReads_;
+  std::vector<int> rotatedLabelReads_;
+  std::vector<std::array<int, 6>> hazardStackCollection_;
+  std::vector<int> emptyLabelReads_;
+
+  // Storage for Semantic Data Freezing
+  std::vector<int> launch_pose_rotation;
+  int average_drift_ = -1;
+
   double resolution_;
   double position_covariance_scale_;
   double yaw_covariance_scale_;
   bool first_measurement_, enable_interactive_mode_;
-  bool restamp_tf_;
 
   // Book keeping
   std::unique_ptr<mapper_utils::SMapper> smapper_;

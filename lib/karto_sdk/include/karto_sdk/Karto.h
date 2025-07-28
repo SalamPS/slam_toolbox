@@ -4376,6 +4376,9 @@ BOOST_SERIALIZATION_ASSUME_ABSTRACT(LaserRangeFinder)
  */
 typedef enum
 {
+  GridHazard_Unknown = 0,
+  GridHazard_Occupied = 1,
+
   GridStates_Unknown = 0,
   GridStates_Occupied = 100,
   GridStates_Free = 255
@@ -5403,6 +5406,12 @@ private:
 ////////////////////////////////////////////////////////////////////////////////////////
 
 /**
+ * Type declaration of hazard labels and related vectors
+ */
+typedef std::vector<int> HazardLabels;
+typedef std::vector<std::vector<int>> HazardLabelsVector;
+
+/**
  * The LocalizedRangeScan contains range data from a single sweep of a laser range finder sensor
  * in a two-dimensional space and position information. The odometer position is the position
  * reported by the robot when the range data was recorded. The corrected position is the position
@@ -5426,19 +5435,44 @@ public:
   }
 
   LocalizedRangeScan()
-  {}
+  {
+  }
 
   /**
    * Destructor
    */
   virtual ~LocalizedRangeScan()
   {
+    // No cleanup needed for value-based member
   }
 
 private:
   mutable std::shared_mutex m_Lock;
 
 public:
+  /**
+   * Save hazard level vector into this scan
+   * @param hLabel hazard labels for this scan
+   * @return kt_bool true if hazard level was saved, false otherwise
+   */
+  virtual kt_bool SaveHazardLabels(const HazardLabels & hLabel)
+  {
+    std::cout << "============SaveHazardLabels" << std::endl;
+    m_HazardLabels = hLabel;  // Direct assignment to member variable
+    std::cout << "Current labels size : " << m_HazardLabels.size() << std::endl;
+    std::cout << "= = = = = = =" << std::endl;
+    return true;
+  }
+
+  /**
+   * Get hazard labels for this scan
+   * @return reference to hazard labels vector
+   */
+  const HazardLabels & GetHazardLabels() const
+  {
+    return m_HazardLabels;
+  }
+
   /**
    * Gets the odometric pose of this scan
    * @return odometric pose of this scan
@@ -5717,6 +5751,7 @@ private:
     ar & BOOST_SERIALIZATION_NVP(m_UnfilteredPointReadings);
     ar & BOOST_SERIALIZATION_NVP(m_BoundingBox);
     ar & BOOST_SERIALIZATION_NVP(m_IsDirty);
+    ar & BOOST_SERIALIZATION_NVP(m_HazardLabels);
     ar & BOOST_SERIALIZATION_BASE_OBJECT_NVP(LaserRangeScan);
   }
 
@@ -5760,6 +5795,11 @@ protected:
    * Internal flag used to update point readings, barycenter and bounding box
    */
   kt_bool m_IsDirty;
+
+  /**
+   * Hazard labels for this scan
+   */
+  HazardLabels m_HazardLabels;
 };    // LocalizedRangeScan
 
 /**
@@ -5867,6 +5907,27 @@ private:
 ////////////////////////////////////////////////////////////////////////////////////////
 ////////////////////////////////////////////////////////////////////////////////////////
 
+/**
+ * Combined cell information structure
+ */
+struct CellInfo
+{
+  kt_int8u occupancyState;    // GridStates (Free, Occupied, Unknown)
+  kt_int8s hLabel;       // GridHazard level
+  kt_int32u passCount;        // Number of beams passed through
+  kt_int32u hitCount;         // Number of beams hit
+  
+  CellInfo() : occupancyState(GridStates_Unknown), hLabel(GridHazard_Unknown), 
+               passCount(0), hitCount(0) {}
+  
+  CellInfo(kt_int8u occ, kt_int8s hazard, kt_int32u pass, kt_int32u hit) 
+    : occupancyState(occ), hLabel(hazard), passCount(pass), hitCount(hit) {}
+};
+
+////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////
+
 class OccupancyGrid;
 
 class KARTO_EXPORT CellUpdater : public Functor
@@ -5909,7 +5970,9 @@ public:
   : Grid<kt_int8u>(width, height),
     m_pCellPassCnt(Grid<kt_int32u>::CreateGrid(0, 0, resolution)),
     m_pCellHitsCnt(Grid<kt_int32u>::CreateGrid(0, 0, resolution)),
-    m_pCellUpdater(NULL)
+    m_pCellHazardLevel(Grid<kt_int8s>::CreateGrid(0, 0, resolution)),
+    m_pCellUpdater(NULL),
+    m_pHazardLabelsVectorOG(new HazardLabelsVector())
   {
     m_pCellUpdater = new CellUpdater(this);
 
@@ -5933,9 +5996,12 @@ public:
 
     delete m_pCellPassCnt;
     delete m_pCellHitsCnt;
+    delete m_pCellHazardLevel;
 
     delete m_pMinPassThrough;
     delete m_pOccupancyThreshold;
+    
+    delete m_pHazardLabelsVectorOG;
   }
 
 public:
@@ -5958,6 +6024,13 @@ public:
     OccupancyGrid * pOccupancyGrid = new OccupancyGrid(width, height, offset, resolution);
     pOccupancyGrid->SetMinPassThrough(min_pass_through); 
     pOccupancyGrid->SetOccupancyThreshold(occupancy_threshold); 
+    
+    // Copy hazard labels from all LocalizedRangeScans to OccupancyGrid
+    std::cout << "============CopyHazardLabelsFromScans" << std::endl;
+    pOccupancyGrid->CopyHazardLabelsFromScans(rScans);
+    
+    std::cout << "= = = = = = =" << std::endl;
+
     pOccupancyGrid->CreateFromScans(rScans);
 
     return pOccupancyGrid;
@@ -5978,6 +6051,7 @@ public:
     pOccupancyGrid->GetCoordinateConverter()->SetSize(GetCoordinateConverter()->GetSize());
     pOccupancyGrid->m_pCellPassCnt = m_pCellPassCnt->Clone();
     pOccupancyGrid->m_pCellHitsCnt = m_pCellHitsCnt->Clone();
+    pOccupancyGrid->m_pCellHazardLevel = m_pCellHazardLevel->Clone();
 
     return pOccupancyGrid;
   }
@@ -6059,6 +6133,91 @@ public:
     m_pOccupancyThreshold->SetValue(thresh);
   }
 
+  /**
+   * Copy hazard labels from LocalizedRangeScans to this OccupancyGrid
+   * @param rScans vector of LocalizedRangeScans to copy hazard labels from
+   */
+  void CopyHazardLabelsFromScans(const LocalizedRangeScanVector & rScans)
+  {
+    std::cout << "Target data copy : " << rScans.size() << std::endl;
+    // Clear existing hazard labels and iterate through all scans and collect their hazard labels
+    if (m_pHazardLabelsVectorOG) {
+      std::cout << "Elder data length: " << m_pHazardLabelsVectorOG->size() << std::endl;
+      m_pHazardLabelsVectorOG->clear();
+    }
+    for (const auto* scan : rScans) {
+      if (scan && !scan->GetHazardLabels().empty()) {
+        m_pHazardLabelsVectorOG->push_back(scan->GetHazardLabels());
+      }
+    }
+    std::cout << "Total data copied: " << m_pHazardLabelsVectorOG->size() << std::endl;
+  }
+
+  /**
+   * Get access to the hazard labels vector
+   * @return pointer to hazard labels vector
+   */
+  HazardLabelsVector * GetHazardLabelsVectorOG() const
+  {
+    return m_pHazardLabelsVectorOG;
+  }
+
+  /**
+   * Get hazard level at specific grid position
+   * @param rPose grid position
+   * @return hazard level value
+   */
+  virtual kt_int8s GetHazardLevel(const Vector2<kt_int32s> & rPose) const
+  {
+    if (IsValidGridIndex(rPose)) {
+      kt_int8s * pHazardPtr = reinterpret_cast<kt_int8s *>(m_pCellHazardLevel->GetDataPointer(rPose));
+      return *pHazardPtr;
+    }
+    return GridHazard_Unknown;
+  }
+
+  /**
+   * Get complete cell information at specific grid position
+   * @param rPose grid position
+   * @return CellInfo structure with all cell data
+   */
+  virtual CellInfo GetCellInfo(const Vector2<kt_int32s> & rPose) const
+  {
+    if (IsValidGridIndex(rPose)) {
+      kt_int32s index = GridIndex(rPose, false);
+      
+      kt_int8u * pOccupancyPtr = GetDataPointer();
+      kt_int8s * pHazardPtr = m_pCellHazardLevel->GetDataPointer();
+      kt_int32u * pPassPtr = m_pCellPassCnt->GetDataPointer();
+      kt_int32u * pHitPtr = m_pCellHitsCnt->GetDataPointer();
+      
+      return CellInfo(pOccupancyPtr[index], pHazardPtr[index], 
+                      pPassPtr[index], pHitPtr[index]);
+    }
+    return CellInfo(); // returns default unknown values
+  }
+
+  /**
+   * Check if grid point has specific hazard level
+   * @param rPose grid position
+   * @param targetHazardLevel hazard level to check
+   * @return whether the cell has the specified hazard level
+   */
+  virtual kt_bool HasHazardLevel(const Vector2<kt_int32s> & rPose, kt_int8s targetHazardLevel) const
+  {
+    return GetHazardLevel(rPose) == targetHazardLevel;
+  }
+
+  /**
+   * Check if grid point is hazardous (hazard level > 0)
+   * @param rPose grid position  
+   * @return whether the cell is hazardous
+   */
+  virtual kt_bool IsHazardous(const Vector2<kt_int32s> & rPose) const
+  {
+    return GetHazardLevel(rPose) > GridHazard_Occupied;
+  }
+
 protected:
   /**
    * Get cell hit grid
@@ -6076,6 +6235,15 @@ protected:
   virtual Grid<kt_int32u> * GetCellPassCounts()
   {
     return m_pCellPassCnt;
+  }
+
+  /**
+   * Get cell hazard level grid
+   * @return Grid<kt_int8s>*
+   */
+  virtual Grid<kt_int8s> * GetHazardLevel()
+  {
+    return m_pCellHazardLevel;
   }
 
 protected:
@@ -6124,6 +6292,15 @@ protected:
 
     m_pCellHitsCnt->Resize(GetWidth(), GetHeight());
     m_pCellHitsCnt->GetCoordinateConverter()->SetOffset(GetCoordinateConverter()->GetOffset());
+
+    m_pCellHazardLevel->Resize(GetWidth(), GetHeight());
+    m_pCellHazardLevel->GetCoordinateConverter()->SetOffset(GetCoordinateConverter()->GetOffset());
+
+    std::cout << "============CreateFromScans" << std::endl;
+    std::cout << "Current labels size : " << m_pHazardLabelsVectorOG->size() << std::endl;
+    std::cout << "Index [0][0] : " << (*m_pHazardLabelsVectorOG)[0][0] << std::endl;
+    std::cout << "Index [0][1] : " << (*m_pHazardLabelsVectorOG)[0][1] << std::endl;
+    std::cout << "= = = = = = =" << std::endl;
 
     const_forEach(LocalizedRangeScanVector, &rScans)
     {
@@ -6179,7 +6356,11 @@ protected:
         point.SetY(scanPosition.GetY() + ratio * dy);
       }
 
-      kt_bool isInMap = RayTrace(scanPosition, point, isEndPointValid, doUpdate);
+      kt_int32u currentId = pScan->GetStateId();
+      HazardLabels hLabel = m_pHazardLabelsVectorOG ? (*m_pHazardLabelsVectorOG)[currentId] : HazardLabels(360, 0);
+      kt_int8s hPoint = hLabel[pointIndex];
+
+      kt_bool isInMap = RayTrace(scanPosition, point, isEndPointValid, doUpdate, hPoint, pointIndex);
       if (!isInMap) {
         isAllInMap = false;
       }
@@ -6193,6 +6374,7 @@ protected:
   /**
    * Traces a beam from the start position to the end position marking
    * the bookkeeping arrays accordingly.
+   * @param hLabel the label of the hazard level at the end point
    * @param rWorldFrom start position of beam
    * @param rWorldTo end position of beam
    * @param isEndPointValid is the reading within the range threshold?
@@ -6203,7 +6385,9 @@ protected:
     const Vector2<kt_double> & rWorldFrom,
     const Vector2<kt_double> & rWorldTo,
     kt_bool isEndPointValid,
-    kt_bool doUpdate = false)
+    kt_bool doUpdate = false,
+    kt_int8s hLabel = 0,
+    int angle = 0)
   {
     assert(m_pCellPassCnt != NULL && m_pCellHitsCnt != NULL);
 
@@ -6221,10 +6405,25 @@ protected:
 
         kt_int32u * pCellPassCntPtr = m_pCellPassCnt->GetDataPointer();
         kt_int32u * pCellHitCntPtr = m_pCellHitsCnt->GetDataPointer();
+        kt_int8s * pCellHazardLevelPtr = m_pCellHazardLevel->GetDataPointer();
 
         // increment cell pass through and hit count
         pCellPassCntPtr[index]++;
         pCellHitCntPtr[index]++;
+
+        // fill hazard level with data given
+        pCellHazardLevelPtr[index] = hLabel;
+        
+        // Debug: verify hazard level is stored correctly
+        // std::cout << "[DEBUG] at angle no. " << angle;
+        // if (hLabel == 1) {
+        //   std::cout 
+        //     << ": Ray tracing at |" << index 
+        //     << "| deg filled [" << static_cast<int>(hLabel)
+        //     << "] as (" << static_cast<int>(pCellHazardLevelPtr[index])
+        //     << ") hit " << pCellHitCntPtr[index] << "x";
+        // }
+        // std::cout << std::endl;
 
         if (doUpdate) {
           (*m_pCellUpdater)(index);
@@ -6240,8 +6439,9 @@ protected:
    * @param pCell
    * @param cellPassCnt
    * @param cellHitCnt
+   * @param cellHazardLevel
    */
-  virtual void UpdateCell(kt_int8u * pCell, kt_int32u cellPassCnt, kt_int32u cellHitCnt)
+  virtual void UpdateCell(kt_int8u * pCell, kt_int32u cellPassCnt, kt_int32u cellHitCnt, kt_int8s cellHazardLevel)
   {
     if (cellPassCnt > m_pMinPassThrough->GetValue()) {
       kt_double hitRatio = static_cast<kt_double>(cellHitCnt) / static_cast<kt_double>(cellPassCnt);
@@ -6266,13 +6466,18 @@ protected:
 
     // set occupancy status of cells
     kt_int8u * pDataPtr = GetDataPointer();
+    kt_int8s * pCellHazardLevelPtr = m_pCellHazardLevel->GetDataPointer();
     kt_int32u * pCellPassCntPtr = m_pCellPassCnt->GetDataPointer();
     kt_int32u * pCellHitCntPtr = m_pCellHitsCnt->GetDataPointer();
+    int updateCount = 0;
 
     kt_int32u nBytes = GetDataSize();
-    for (kt_int32u i = 0; i < nBytes; i++, pDataPtr++, pCellPassCntPtr++, pCellHitCntPtr++) {
-      UpdateCell(pDataPtr, *pCellPassCntPtr, *pCellHitCntPtr);
+    for (kt_int32u i = 0; i < nBytes; i++, pDataPtr++, pCellPassCntPtr++, pCellHitCntPtr++, pCellHazardLevelPtr++, updateCount++) {
+    // for (kt_int32u i = 0; i < nBytes; i++, pDataPtr++, pCellPassCntPtr++, pCellHitCntPtr++) {
+      UpdateCell(pDataPtr, *pCellPassCntPtr, *pCellHitCntPtr, *pCellHazardLevelPtr);
     }
+
+    // std::cout << "OccupancyGrid::Update: Updated " << updateCount << " cells." << std::endl;
   }
 
   /**
@@ -6285,6 +6490,7 @@ protected:
     Grid<kt_int8u>::Resize(width, height);
     m_pCellPassCnt->Resize(width, height);
     m_pCellHitsCnt->Resize(width, height);
+    m_pCellHazardLevel->Resize(width, height);
   }
 
 protected:
@@ -6298,6 +6504,11 @@ protected:
    */
   Grid<kt_int32u> * m_pCellHitsCnt;
 
+  /**
+   * Hazard level holder for a cell
+   */
+  Grid<kt_int8s> * m_pCellHazardLevel;
+
 private:
   /**
    * Restrict the copy constructor
@@ -6308,6 +6519,9 @@ private:
    * Restrict the assignment operator
    */
   const OccupancyGrid & operator=(const OccupancyGrid &);
+
+public:
+  HazardLabelsVector * m_pHazardLabelsVectorOG;    // Vector of hazard labels for each scan
 
 private:
   CellUpdater * m_pCellUpdater;

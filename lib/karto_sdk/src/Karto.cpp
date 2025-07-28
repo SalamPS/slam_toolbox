@@ -142,8 +142,10 @@ void CellUpdater::operator()(kt_int32u index)
   kt_int8u * pDataPtr = m_pOccupancyGrid->GetDataPointer();
   kt_int32u * pCellPassCntPtr = m_pOccupancyGrid->m_pCellPassCnt->GetDataPointer();
   kt_int32u * pCellHitCntPtr = m_pOccupancyGrid->m_pCellHitsCnt->GetDataPointer();
+  kt_int8s * pCellHazardLevelPtr = m_pOccupancyGrid->m_pCellHazardLevel->GetDataPointer();
 
-  m_pOccupancyGrid->UpdateCell(&pDataPtr[index], pCellPassCntPtr[index], pCellHitCntPtr[index]);
+  std::cout << "Adding point on " << std::endl;
+  m_pOccupancyGrid->UpdateCell(&pDataPtr[index], pCellPassCntPtr[index], pCellHitCntPtr[index], pCellHazardLevelPtr[index]);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////

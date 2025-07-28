@@ -125,16 +125,18 @@ inline void toNavMap(
   for (kt_int32s y = 0; y < height; y++) {
     for (kt_int32s x = 0; x < width; x++) {
       kt_int8u value = occ_grid->GetValue(karto::Vector2<kt_int32s>(x, y));
+      kt_int8s hLabel = occ_grid->GetHazardLevel(karto::Vector2<kt_int32s>(x, y));
+      map.data[MAP_IDX(map.info.width, x, y)] = hLabel;
+
       switch (value) {
-        case karto::GridStates_Unknown:
+        case karto::GridHazard_Unknown:
           map.data[MAP_IDX(map.info.width, x, y)] = -1;
           break;
-        case karto::GridStates_Occupied:
+        case karto::GridHazard_Occupied:
           map.data[MAP_IDX(map.info.width, x, y)] = 100;
           break;
-        case karto::GridStates_Free:
-          map.data[MAP_IDX(map.info.width, x, y)] = 0;
-          break;
+        default:
+          map.data[MAP_IDX(map.info.width, x, y)] = hLabel;
       }
     }
   }
